@@ -20,7 +20,36 @@ import joblib
 import time
 from datetime import datetime, timedelta
 import warnings
+import mlflow
+import mlflow.sklearn
+import os
+from pathlib import Path
 warnings.filterwarnings('ignore')
+
+# Set MLflow tracking URI (use file-based for Streamlit Cloud compatibility)
+MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI', './mlruns')
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+# Ensure experiment exists and is set
+EXPERIMENT_NAME = "hydraulic_system_monitoring"
+try:
+    experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
+    if experiment is None:
+        experiment_id = mlflow.create_experiment(EXPERIMENT_NAME)
+        mlflow.set_experiment(EXPERIMENT_NAME)
+    else:
+        mlflow.set_experiment(EXPERIMENT_NAME)
+except Exception as e:
+    # Fallback: try to set it, and if that fails, create default experiment
+    try:
+        mlflow.set_experiment(EXPERIMENT_NAME)
+    except Exception:
+        try:
+            mlflow.create_experiment(EXPERIMENT_NAME)
+            mlflow.set_experiment(EXPERIMENT_NAME)
+        except Exception:
+            # Use default experiment if all else fails
+            pass
 
 # Set page configuration
 st.set_page_config(
@@ -238,6 +267,7 @@ class AdvancedMLSystem:
         self.trained_models = {}
         self.feature_names = None
         self.target_names = None
+        self.mlflow_runs = {}
     
     def prepare_data(self, df, problem_type='classification'):
         """Prepare data for different types of problems"""
@@ -262,13 +292,42 @@ class AdvancedMLSystem:
         
         return X_train_scaled, X_test_scaled, y_train, y_test, X_test
     
-    def train_models(self, X_train, y_train, model_type='classification'):
-        """Train multiple models"""
+    def train_models(self, X_train, y_train, model_type='classification', use_mlflow=True):
+        """Train multiple models with MLflow tracking"""
         results = {}
         models_dict = self.classification_models if model_type == 'classification' else self.anomaly_models
         
         for name, model in models_dict.items():
             start_time = time.time()
+            
+            # Start MLflow run
+            if use_mlflow:
+                run_name = f"{name}_{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                # Ensure experiment is set before starting run
+                try:
+                    # Get or create experiment
+                    experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
+                    if experiment is None:
+                        experiment_id = mlflow.create_experiment(EXPERIMENT_NAME)
+                    mlflow.set_experiment(EXPERIMENT_NAME)
+                except Exception as e:
+                    # If all else fails, create experiment with absolute path
+                    try:
+                        mlflow.create_experiment(EXPERIMENT_NAME, artifact_location=MLFLOW_TRACKING_URI)
+                        mlflow.set_experiment(EXPERIMENT_NAME)
+                    except:
+                        pass
+                # Start run - DO NOT use nested=True
+                mlflow.start_run(run_name=run_name)
+                
+                # Log model parameters
+                if hasattr(model, 'get_params'):
+                    mlflow.log_params(model.get_params())
+                mlflow.log_param("model_name", name)
+                mlflow.log_param("model_type", model_type)
+                mlflow.log_param("n_features", X_train.shape[1])
+                mlflow.log_param("n_samples", X_train.shape[0])
+            
             model.fit(X_train, y_train)
             training_time = time.time() - start_time
             
@@ -278,11 +337,24 @@ class AdvancedMLSystem:
                 'training_time': training_time
             }
             results[name] = {'training_time': training_time}
+            
+            # Log training metrics
+            if use_mlflow:
+                mlflow.log_metric("training_time_seconds", training_time)
+                
+                # Log model artifact
+                try:
+                    mlflow.sklearn.log_model(model, f"{name}_model")
+                    self.mlflow_runs[name] = mlflow.active_run().info.run_id
+                except Exception as e:
+                    st.warning(f"Could not log model to MLflow: {str(e)}")
+                
+                mlflow.end_run()
         
         return results
     
-    def evaluate_classification(self, X_test, y_test):
-        """Evaluate classification models"""
+    def evaluate_classification(self, X_test, y_test, use_mlflow=True):
+        """Evaluate classification models with MLflow tracking"""
         results = {}
         for name, model_info in self.trained_models.items():
             if model_info['type'] == 'classification':
@@ -303,11 +375,43 @@ class AdvancedMLSystem:
                     'predictions': y_pred,
                     'probabilities': y_proba
                 }
+                
+                # Log metrics to MLflow
+                if use_mlflow and name in self.mlflow_runs:
+                    try:
+                        run_id = self.mlflow_runs[name]
+                        # Use client API to log to existing run
+                        client = mlflow.tracking.MlflowClient()
+                        client.log_metric(run_id, "test_accuracy", accuracy)
+                        client.log_metric(run_id, "test_precision", precision)
+                        client.log_metric(run_id, "test_recall", recall)
+                        client.log_metric(run_id, "test_f1_score", f1)
+                        
+                        # Log confusion matrix as artifact
+                        cm = confusion_matrix(y_test, y_pred)
+                        cm_df = pd.DataFrame(cm)
+                        # Use a more portable temp directory
+                        temp_dir = Path("./.mlflow_temp")
+                        temp_dir.mkdir(exist_ok=True)
+                        cm_path = temp_dir / f"cm_{name}.csv"
+                        cm_df.to_csv(cm_path, index=False)
+                        client.log_artifact(run_id, str(cm_path), "confusion_matrix")
+                        os.remove(cm_path)  # Cleanup
+                    except Exception as e:
+                        # Fallback: try to start a new run if original is closed
+                        try:
+                            with mlflow.start_run(run_name=f"{name}_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+                                mlflow.log_metric("test_accuracy", accuracy)
+                                mlflow.log_metric("test_precision", precision)
+                                mlflow.log_metric("test_recall", recall)
+                                mlflow.log_metric("test_f1_score", f1)
+                        except Exception as e2:
+                            st.warning(f"Could not log metrics to MLflow: {str(e2)}")
         
         return results
     
-    def evaluate_regression(self, X_test, y_test):
-        """Evaluate regression models for RUL prediction"""
+    def evaluate_regression(self, X_test, y_test, use_mlflow=True):
+        """Evaluate regression models for RUL prediction with MLflow tracking"""
         results = {}
         # For simplicity, using classification models for regression (in practice, use regressors)
         for name, model_info in self.trained_models.items():
@@ -328,6 +432,25 @@ class AdvancedMLSystem:
                         'r2': r2,
                         'predictions': y_pred
                     }
+                    
+                    # Log metrics to MLflow
+                    if use_mlflow and name in self.mlflow_runs:
+                        try:
+                            run_id = self.mlflow_runs[name]
+                            # Use client API to log to existing run
+                            client = mlflow.tracking.MlflowClient()
+                            client.log_metric(run_id, "test_mse", mse)
+                            client.log_metric(run_id, "test_mae", mae)
+                            client.log_metric(run_id, "test_r2", r2)
+                        except Exception as e:
+                            # Fallback: try to start a new run if original is closed
+                            try:
+                                with mlflow.start_run(run_name=f"{name}_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+                                    mlflow.log_metric("test_mse", mse)
+                                    mlflow.log_metric("test_mae", mae)
+                                    mlflow.log_metric("test_r2", r2)
+                            except Exception as e2:
+                                st.warning(f"Could not log metrics to MLflow: {str(e2)}")
         
         return results
 
@@ -681,6 +804,7 @@ def main():
                     st.session_state.problem_type = problem_type
                     
                     st.success("✅ All models trained successfully!")
+                    st.info(f"📊 MLflow: All experiments logged to {MLFLOW_TRACKING_URI}")
             
             if st.session_state.trained:
                 eval_results = st.session_state.eval_results
@@ -1036,6 +1160,24 @@ def main():
     elif page == "⚙️ MLOps Management":
         st.header("⚙️ MLOps & Model Management")
         
+        # MLflow Configuration
+        st.subheader("📊 MLflow Tracking")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"**Tracking URI:** {MLFLOW_TRACKING_URI}")
+            st.info(f"**Experiment:** hydraulic_system_monitoring")
+        with col2:
+            try:
+                # Get experiment info
+                experiment = mlflow.get_experiment_by_name("hydraulic_system_monitoring")
+                if experiment:
+                    st.metric("Experiment ID", experiment.experiment_id)
+                    # Count runs
+                    runs = mlflow.search_runs(experiment_ids=[experiment.experiment_id])
+                    st.metric("Total Runs", len(runs))
+            except Exception as e:
+                st.warning(f"Could not fetch MLflow info: {str(e)}")
+        
         st.subheader("🔧 System Configuration")
         
         col1, col2, col3, col4 = st.columns(4)
@@ -1048,8 +1190,38 @@ def main():
         with col4:
             st.metric("System Load", "42%", "8%")
         
+        # MLflow Runs Display
+        st.subheader("📚 MLflow Experiments")
+        try:
+            experiment = mlflow.get_experiment_by_name("hydraulic_system_monitoring")
+            if experiment:
+                runs = mlflow.search_runs(
+                    experiment_ids=[experiment.experiment_id],
+                    max_results=10,
+                    order_by=["start_time DESC"]
+                )
+                
+                if len(runs) > 0:
+                    # Display recent runs
+                    runs_display = runs[['run_id', 'tags.mlflow.runName', 'metrics.test_accuracy', 
+                                       'metrics.test_f1_score', 'metrics.training_time_seconds', 
+                                       'start_time']].head(10).copy()
+                    runs_display.columns = ['Run ID', 'Run Name', 'Accuracy', 'F1 Score', 'Training Time (s)', 'Start Time']
+                    runs_display = runs_display.fillna('N/A')
+                    st.dataframe(runs_display, use_container_width=True)
+                    
+                    # Show best model
+                    if 'metrics.test_accuracy' in runs.columns:
+                        best_run = runs.loc[runs['metrics.test_accuracy'].idxmax()]
+                        st.success(f"🏆 Best Model: {best_run.get('tags.mlflow.runName', 'Unknown')} "
+                                 f"(Accuracy: {best_run['metrics.test_accuracy']:.3f})")
+                else:
+                    st.info("No MLflow runs yet. Train models to see experiments here.")
+        except Exception as e:
+            st.warning(f"Could not load MLflow runs: {str(e)}")
+        
         # Model Version Management
-        st.subheader("📚 Model Versions")
+        st.subheader("📦 Registered Models")
         
         versions = [
             {"Version": "v2.1.0", "Status": "Production", "Accuracy": "94.2%", "Created": "2024-01-15"},

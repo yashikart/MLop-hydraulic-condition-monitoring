@@ -1,0 +1,33 @@
+services:
+  hydraulic-monitor:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./pretrained_models:/app/pretrained_models
+    environment:
+      - MLFLOW_TRACKING_URI=./mlruns
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  mlflow-ui:
+    image: python:3.10-slim
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+    working_dir: /mlruns
+    command: >
+      sh -c "pip install mlflow && 
+             mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri file:///mlruns"
+    restart: unless-stopped
+    depends_on:
+      - hydraulic-monitor
+
